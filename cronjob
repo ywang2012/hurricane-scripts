@@ -1,0 +1,19 @@
+#!/bin/tcsh -f
+
+set datein = `date +%Y%m%d`
+set timein = `date +%k`
+
+source /lsf/conf/cshrc.lsf
+
+#set datein = "20120903"
+#set timein = 18
+
+if ($timein < 14) then
+  /scratch/ywang/hurr2/scripts/runh2 -q normal ${datein}gfs00Z &
+  sleep 10
+  /scratch/ywang/hurr2/scripts/runh2 -q normal ${datein}ekf00Z &
+else
+  /scratch/ywang/hurr2/scripts/runh2 -q normal ${datein}gfs12Z &
+  sleep 10
+  /scratch/ywang/hurr2/scripts/runh2 -q normal ${datein}ekf12Z &
+endif

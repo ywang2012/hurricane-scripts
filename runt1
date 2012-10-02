@@ -1,0 +1,735 @@
+#!/usr/bin/env python
+## ---------------------------------------------------------------------------
+## This software is in the public domain, furnished "as is", without technical
+## support, and with no warranty, express or implied, as to its usefulness for
+## any purpose.
+## ---------------------------------------------------------------------------
+##
+## PURPOSE:
+##
+##   This is a python program that processes WRF 2D high frequency output
+##   with ARPSPLT and transfer the generated images to CAPS web server
+##
+## HISTORY:
+##   Yunheng Wang (09/15/2011)
+##   Improved with option "-n" and convenience of changeing number of
+##   processors.
+##
+## ---------------------------------------------------------------------
+##
+## REQUIREMENT:
+##
+########################################################################
+
+import os, sys, getopt, re, time
+import subprocess, threading
+
+##======================================================================
+## USAGE
+##======================================================================
+def usage( istatus = 0 ) :
+  '''-------------------------------------------------------------------
+  Print Usage and then exit
+  -------------------------------------------------------------------'''
+  print >> sys.stderr, '''
+    Usage: %s [option] YYYYMMDDCASEhhZ [VAR]\n
+    \tDATE\t Date to be processed, for example 20100915
+    \tTime\t Time to be processed, for example, 00Z or 12Z
+    \tCASE\t Case to be processed. Valid are 'gfs' or 'ekf'
+    \tVAR\t Name of the variable to be unpack or transfer.
+    \t\t Valid variables are 'comref', 'maxspd', and 'maxsfc'
+    OPTIONs:\n
+    \tOption \t\tDefault \tInstruction
+    \t-------\t\t--------\t-----------
+    \t-d, --verbose\tNone\t\tVerbose
+    \t-h, --help         \t\tPrint this help
+    \t-n, --norun\t              \tPrepare job scripts, but do not actually submit them
+    \t-q, --queue\tcaps_forecast \tqueue name for the jobs
+    \t-r, --rename\tNone       \tRun rename and transfer only
+    \t-u, --unpack\tNone       \tRun unpack only
+    ''' % cmd
+  sys.exit(istatus)
+#enddef
+
+##======================================================================
+## Parse command line arguments
+##======================================================================
+def parseArgv(argv) :
+  '''-------------------------------------------------------------------
+  Parse command line arguments
+  -------------------------------------------------------------------'''
+  global _debug, run_mode, queuename
+
+  run_mode = 0
+  try:
+    opts, args = getopt.getopt(argv,'hvurq:dn',           \
+           ['help','verbose','unpack','rename','queue','norun'])
+
+    for opt, arg in opts :
+      if opt in ('-h','--help'):
+        usage(0)
+      elif opt in ( '-v','-d', '--verbose'):
+        _debug = 1
+      elif opt in ( '-u', '--unpack'):
+        run_mode = 2
+      elif opt in ( '-r', '--rename'):
+        run_mode = 3
+      elif opt in ( '-n', '--norun') :
+        run_mode = -1
+      elif opt in ( '-q', '--queue') :
+        queuename = arg
+
+  except getopt.GetoptError:
+    print >> sys.stderr, 'ERROR: Unknown option.'
+    usage(2)
+
+  if ( len(args) >= 1 ) :
+    oneargs = re.match('(\d{4}\d{2}\d{2})(gfs|ekf)(00Z|12Z)',args[0])
+    if oneargs:
+      (date,case,ztime) = oneargs.group(1,2,3)
+      if (len(args) == 1) :
+        argvs = (date,case,ztime,['comref','maxspd','maxsfc'])
+      elif (len(args) >= 2) :
+        argvs = (date,case,ztime,args[1:])
+    else :
+      print >> sys.stderr, 'Argument %s is in wrong format.' % (args[0])
+      usage(1)
+  else :
+    print >> sys.stderr, 'ERROR: wrong number of command line arguments.'
+    usage(1)
+
+  return argvs
+#enddef
+
+##======================================================================
+## MAIN program here
+##======================================================================
+def main(runCase,datein,casein,timein,fieldin) :
+  global _debug, runmode, outfile
+  global workdir, datadir
+
+  '''-------------------------------------------------------------------
+  Main work should be done here
+  -------------------------------------------------------------------'''
+
+  dateRe = re.compile('(\d{4})(\d{2})(\d{2})')
+  caseRe = re.compile('(gfs|ekf)')
+  timeRe = re.compile('(\d{2})Z')
+
+  '''-------------------------------------------------------------------
+  Make sure passing in parameters are right and make directories as necessary
+  -------------------------------------------------------------------'''
+  if not dateRe.match(datein) :
+    print >> sys.stderr, 'datein = %s is not in right format.\n' % (datein)
+    usage()
+
+  if not caseRe.match(casein) :
+    print >> sys.stderr, 'casein = %s is not in right format.\n' % (casein)
+    usage()
+
+  if not timeRe.match(timein) :
+    print >> sys.stderr, 'timein = %s is not in right format.\n' % (timein)
+    usage()
+
+  dateDir = workdir + '/'+datein
+  if not os.path.exists(dateDir):
+    os.mkdir(dateDir)
+
+  caseDir = dateDir + '/' + casein + timein
+  if not os.path.exists(caseDir) :
+    os.mkdir(caseDir)
+
+  '''-------------------------------------------------------------------
+  Copy or link data files
+  --------------------------------------------------------------------'''
+  os.chdir(caseDir)
+
+  if run_mode < 1 :
+    if not os.path.exists('data2d') :
+      os.mkdir('data2d')
+
+    print >> outfile, '--- 1 ---'
+
+    srcC = runCase.getRunname()
+    srcDir = datadir+'/wrf-%s/%s/%s00Z/' % (srcC[casein],datein,timein[0:2])
+    print >> outfile, 'Linking data from %s to %s ...' % (srcDir,caseDir)
+    if run_mode > -1 : link_data(srcDir,datein+timein[0:2], caseDir)
+
+
+  '''-------------------------------------------------------------------
+  Process each field in order
+  -------------------------------------------------------------------'''
+  print >> outfile, '--- 2 ---'
+
+  for field in fieldin:
+    print >> outfile, 'Processing %s for %s%s%sZ ...' %(field,datein,casein,timein)
+    field_processor(runCase,workdir,datein,timein,casein,field).start()
+
+  outfile.flush()
+
+  while threading.activeCount() > 1:
+    ##print "active threads : %d" % threading.activeCount()
+    ##print threading.currentThread()
+    time.sleep(10)
+
+#enddef
+
+##======================================================================
+
+def link_data(srcdir, casename, destdir) :
+  '''
+  PURPOSE: link data from srcdir to destdir and prepare with 2D arbitrary files
+  '''
+
+  os.chdir(destdir)
+
+  cmdline = 'ln -s %s/em%s.hdfgrdbas_* %s;rm *_ready;rename em ar em%s.hdfgrdbas*'%(srcdir,casename,destdir,casename)
+  #cmdline = 'ln -s %s/ar%s.hdfgrdbas_* %s;rm *_ready'%(srcdir,casename,destdir)
+  subprocess.Popen(cmdline,shell=True).wait()
+
+  os.chdir(destdir+'/data2d')
+
+  cmdline = 'ln -s %s/data2d/ar%s.netcomref* .;rename comref usfc__ ar%s.netcomref*'%(srcdir,casename,casename)
+  subprocess.Popen(cmdline,shell=True).wait()
+
+  cmdline = 'ln -s %s/data2d/ar%s.netcomref* .;rename comref vsfc__ ar%s.netcomref*'%(srcdir,casename,casename)
+  subprocess.Popen(cmdline,shell=True).wait()
+
+  cmdline = 'ln -s %s/data2d/ar%s.netcomref* .;rename comref mslp__ ar%s.netcomref*'%(srcdir,casename,casename)
+  subprocess.Popen(cmdline,shell=True).wait()
+
+  cmdline = 'ln -s %s/data2d/ar%s.netcomref* .;rename comref maxspd ar%s.netcomref*'%(srcdir,casename,casename)
+  subprocess.Popen(cmdline,shell=True).wait()
+
+  cmdline = 'ln -s %s/data2d/ar%s.netcomref* .;rename comref maxsfc ar%s.netcomref*'%(srcdir,casename,casename)
+  subprocess.Popen(cmdline,shell=True).wait()
+
+  cmdline = 'ln -s %s/data2d/ar%s.netcomref* .'%(srcdir,casename)
+  subprocess.Popen(cmdline,shell=True).wait()
+
+  os.chdir(destdir)
+
+#enddef
+
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+##
+## CLASS field_proccessor
+##
+## Contains:
+##   run
+##
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+class field_processor(threading.Thread) :
+  ## Override Thread's __init__ method to accept the parameters needed:
+  def __init__(self,runCase,workdir,datestr,timestr,casestr,fieldstr) :
+
+    self.date  = datestr
+    self.time  = timestr[0:2]
+    self.case  = casestr
+    self.field = fieldstr
+
+    self.casename = casestr+timestr
+    self.casedir  = workdir + '/' + datestr + '/' + self.casename
+
+    self.workdir  = workdir
+
+    self.caseNames = runCase.getCasename()
+    (n,m) = runCase.getFrames()
+    (size,smod) = divmod(m,n)
+    self.patchSize = []
+    for i in range(n) :
+      self.patchSize.append(size)
+    self.patchSize[0] += smod
+
+    ##self.patchSize = (200,200,177)
+    self.bgnTimes = [0]
+    n = 0
+    for i in self.patchSize :
+      n += i
+      self.bgnTimes.append(n*300)
+
+    ##self.runCase = runCase
+    self.procs = runCase.getProcessors()
+    self.castr = runCase.getCaptionString(self.case)
+    self.fostr = runCase.getFooterString(self.case)
+    self.dname = runCase.getDestname()
+
+    threading.Thread.__init__(self)
+  #enddef
+
+  def run (self) :
+
+    global _debug, run_mode, queuename, outfile
+
+    ##
+    ## Set number of processors
+    ##
+    nxproc = self.procs['nproc_x']
+    nyproc = self.procs['nproc_y']
+    nnodes = 6
+    ntotal = nxproc*nyproc
+    (npnode, nmod) = divmod(ntotal,nnodes)
+    if nmod > 0 : npnode += 1
+
+    if run_mode < 1 :
+      '''-------------------------------------------------------------------
+      Prepare namelist file and batch script for plotting
+      --------------------------------------------------------------------'''
+      plotbsub = 'plt_%s.bsub'%(self.field)
+      jobname  = 'P%s%s%sZ%s' %(self.date[6:8],self.casename[0],self.casename[3:5],self.field[3:])
+
+      print >> outfile, 'Generating batch file %s ...' % (plotbsub)
+
+      batchFile = open(plotbsub,'w')
+      batchFile.write('''#!/bin/sh
+#BSUB -q %s
+#BSUB -a mvapich
+#BSUB -n %d
+#BSUB -x
+#BSUB -R span[ptile=%d]
+#BSUB -W 02:00
+#BSUB -o plt_%s_%s_%%J.out
+#BSUB -e plt_%s_%s_%%J.err
+#BSUB -J "%s"
+#
+
+export MPI_COMPILER=intel
+export MPI_INTERCONNECT=ib
+#
+
+# Change to the directory that you want to run in.
+#
+cd %s/%s/%s
+#
+# Make sure you're in the correct directory.
+#
+pwd
+#
+# Run the job, redirecting input from the given file.  The date commands
+# and the time command help track runtime and performance.
+#
+date
+
+\n'''%(queuename,ntotal,npnode,
+       self.casename,self.field,
+       self.casename,self.field,
+       jobname,
+       self.workdir,self.date,self.casename
+        )
+      )
+
+      for i in range(len(self.patchSize)) :
+        j = i+1
+        cmdline = "sed -e 's/YYYYMMDDTT/%s/' -e 's/TBGN/%d/' -e 's/TEND/%d/' " \
+                  "-e 's/OUTNAME/%s%02d/' -e 's/TITLESTR/%s/' -e 's/FOOTERSTR/%s/' "    \
+                  "-e '/nproc_x=/s/NPROCX/%d/' -e '/nproc_y=/s/NPROCY/%d/' "    \
+                  "-e '/max_fopen=/s/MAXFOPEN/%d/' "    \
+                  "-e '/nprocx_in=/s/NPROCXIN/%d/' -e '/nprocy_in=/s/NPROCYIN/%d/' "    \
+                  "%s/scripts/%s.pltin > %s/%s%02d.pltin  " % (
+                  self.date+self.time,self.bgnTimes[i],self.bgnTimes[j]-300,
+                  self.field,j,self.castr,self.fostr,
+                  nxproc,nyproc,ntotal,self.procs['nprocx_in'],self.procs['nprocy_in'],
+                  self.workdir,self.field,self.casedir,self.field,j)
+
+        subprocess.Popen(cmdline,shell=True).wait()
+        if _debug : print >> outfile, 'Namelist %s is generated.' % ('%s%d.pltin'%(self.field,j) )
+
+        batchFile.write('''mpirun.lsf /mnt/spring2/ywang/scripts/arpspltncar_mpi < %s%02d.pltin\n'''%(self.field,j))
+
+      batchFile.write('''date\n''')
+      batchFile.close()
+
+      if _debug : print >> outfile, 'Batch script plt_%s.bsub is generated.' % (self.field)
+
+      '''-------------------------------------------------------------------
+      Submit the plotting job
+      --------------------------------------------------------------------'''
+      starttime = time.time()
+      cmdline = "bsub -K < %s/%s" % (self.casedir,plotbsub)
+      if run_mode > -1 :
+        subprocess.Popen(cmdline,shell=True,stderr=outfile,stdout=outfile).wait()
+      print >> outfile, 'Plot %s used %f seconds(includes waiting time).\n' % (self.field,time.time()-starttime)
+      outfile.flush()
+
+    '''-------------------------------------------------------------------
+    Convert and transfer separately for normal size and big images
+    --------------------------------------------------------------------'''
+    print >> outfile, '--- 3-%s ---' % self.field
+
+    print >> outfile, 'Image processing for %s ...' % (self.field)
+    imgT1 = imgConverter(self.workdir,self.date,self.casename,self.field,        self.patchSize,self.dname)
+    imgT1.start()
+
+    print >> outfile, 'Image processing for %s ...' % (self.field+'_big')
+    imgT2 = imgConverter(self.workdir,self.date,self.casename,self.field+'_big',self.patchSize,self.dname)
+    imgT2.start()
+
+    outfile.flush()
+
+    imgT1.join()
+    imgT2.join()
+
+  #enddef
+#endclass
+
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+##
+## CLASS imgConverter
+##
+## Contains:
+##   run
+##   image_rename
+##
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+class imgConverter(threading.Thread):
+
+  ## Override Thread's __init__ method to accept the parameters needed:
+  def __init__(self,workdir,datestr,casestr,namestr,starts,downname) :
+    self.workdir = workdir
+    self.casedir = workdir + '/' + datestr + '/' + casestr
+    self.date = datestr
+    self.case = casestr
+    self.name = namestr         ## real name
+    self.downdir  = downname
+
+    if namestr[-4:] == '_big' :
+      self.width  = 1500
+      self.height = 1500
+      self.field  = namestr[:-4]    ## Field only
+      self.getscript = 'getdata_big'
+      self.big = 'B'
+    else :
+      self.width  = 1000
+      self.height = 1000
+      self.field  = namestr
+      self.getscript = 'getdata'
+      self.big = 'N'
+
+    self.time = casestr[3:5]
+    self.bgnSeq = [0]
+    n = 0
+    for i in starts :
+      n += i
+      self.bgnSeq.append(n)
+
+    threading.Thread.__init__(self)
+  #enddef
+
+  def run (self) :
+
+    global _debug, run_mode, queuename
+
+    os.chdir(self.casedir)
+
+    if run_mode < 3 :
+      '''-------------------------------------------------------------------
+      Prepare batch scripts
+      --------------------------------------------------------------------'''
+
+      numSeq = len(self.bgnSeq)
+      if ((numSeq-1)/3 > 8) :
+        print >> outfile, 'The unpack job cannot fit in three nodes. Script needs more work ...'
+        sys.exist(-1)
+
+      unpackbsub = 'unpack_%s.bsub'%self.name
+      jobname    = 'U%s%s%s%s%s'%(self.date[6:8],self.case[0],self.time,self.big,self.name[3:6])
+
+      print >> outfile, 'Generating bsub file %s ...' % unpackbsub
+
+      fileBatch = open(unpackbsub,'w')
+
+      fileBatch.write('''#!/bin/sh
+#BSUB -q %s
+#BSUB -n %d
+#BSUB -x
+#BSUB -R span[ptile=%d]
+#BSUB -W 04:00
+#BSUB -o unpack_%s_%%J.out
+#BSUB -e unpack_%s_%%J.err
+#BSUB -J "%s"
+#
+
+#
+
+# Change to the directory that you want to run in.
+#
+wrkdir=%s/%s/%s/%s
+cd $wrkdir
+#
+# Make sure you're in the correct directory.
+#
+pwd
+
+#
+# Run the job, redirecting input from the given file.  The date commands
+# and the time command help track runtime and performance.
+#
+date\n''' %(queuename,numSeq-1,(numSeq-1)/3,self.name,self.name,
+            jobname,
+            self.workdir,self.date,self.case,self.name)
+      )
+
+      if not os.path.exists(self.name) :
+        os.mkdir(self.name)
+
+      for i in range(1,numSeq) :
+        fileBatch.write('''ln -s ../%s%02d.gmeta .\n'''%(self.field,i))
+
+      fileBatch.write('''
+i=0
+for node in $LSB_HOSTS
+do
+  let "i = $i+1"
+  seq=`printf "%%02d" $i`
+  ssh $node "cd $wrkdir;/home/ywang/bin/gmeta2png -r %dx%d %s$seq.gmeta" &\n
+done
+'''%(self.width,self.height,self.field) )
+
+      fileBatch.write('wait\n')
+
+      for i in range(1,numSeq) :
+        fileBatch.write('rm %s%02d.gmeta\n' %(self.field,i))
+
+      fileBatch.write('date\n\n')
+      fileBatch.close()
+
+      '''-------------------------------------------------------------------
+      Submit the jobs
+      --------------------------------------------------------------------'''
+
+      starttime = time.time()
+      print >> outfile, 'Submitting jobs %s ...' % unpackbsub
+      cmdline = "bsub -K < %s/%s" % (self.casedir,unpackbsub)
+      if run_mode > -1 :
+        subprocess.Popen(cmdline,shell=True,stderr=outfile,stdout=outfile).wait()
+      ##outfile.flush()
+      print >> outfile, 'Unpack %s used (includes waiting time) %f seconds.\n' % (self.name,time.time()-starttime)
+      ##outfile.flush()
+
+    '''-------------------------------------------------------------------
+    Waiting converting to be finished and then transfer it to downdraft
+    --------------------------------------------------------------------'''
+    print >> outfile, '--- 4-%s --- ' % self.name
+    print >> outfile, 'Rename the converted image files for %s ...' % self.name
+    if _debug : print 'Renaming %s ...'% self.name
+    if run_mode > -1 : self.image_rename()
+
+    print >> outfile, '--- 5-%s --- ' % self.name
+    print >> outfile, 'Transfering %s to CAPS webserver with script %s ...' % (self.name, self.getscript)
+    cmdline = "ssh downdraft.caps.ou.edu /import/animdata_2d/%s/%s %s %s %s" % (
+              self.downdir,self.getscript,self.date,self.case,self.field)
+    if _debug : print 'Executing %s ...'%cmdline
+    if run_mode > -1 :
+      subprocess.Popen(cmdline,shell=True,stderr=outfile,stdout=outfile).wait()
+
+  #enddef
+
+  def image_rename(self) :
+    '''
+    PURPOSE: rename images to following a sequence based on passing in list starts
+    '''
+
+    global _debug
+
+    fielddir = os.path.join(self.casedir,self.name)
+    fileRe = re.compile('%s(\d{1,2}).gmeta(\d{3}).png'% self.field)
+
+    ##os.chdir(self.casedir)               ## it is process-global, not thread-safe
+    files = os.listdir(self.name)
+    for gfile in files :
+      fileMatch = fileRe.match(gfile)
+      if fileMatch:
+        seq = int(fileMatch.group(1))
+        seq -= 1
+        order = int(fileMatch.group(2))
+        newfile = '%s%03d.png' % (self.field,self.bgnSeq[seq]+order)
+        if _debug :
+          print >> outfile, 'Renaming %s/%s to %s ' % (fielddir,gfile, newfile)
+        os.rename(os.path.join(self.name,gfile),os.path.join(self.name,newfile))
+  #enddef
+
+#endclass
+
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+##
+## class case
+##
+## hurricane1 hurricane over Atlantic ocean with 2010/2011 domain
+## hurricane2 hurricane over Atlantic ocean with over 2012 domain
+## typhoon1   typhoon over Pacific ocean with 2010 domain
+##
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+class caseConfiguration(object):
+  '''Run case Configuration'''
+
+  def __init__(self,casein):
+    if casein not in ('hurricane1','hurricane2','typhoon1') :
+      raise runException('ERROR: unsupported case id: '+casein)
+
+    self.caseid = casein
+  #enddef
+
+  def getProcessors(self) :
+    ''' return dict (nproc_x,nproc_y,max_fopen,nprocx_in,nprocy_in) '''
+
+    processors = {
+      'hurricane1': { 'nproc_x': 3, 'nproc_y':  9, 'max_fopen': 27, 'nprocx_in':  9, 'nprocy_in': 36 },
+      'hurricane2': { 'nproc_x': 2, 'nproc_y': 24, 'max_fopen': 48, 'nprocx_in': 10, 'nprocy_in': 48 },
+      'typhoon1'  : { 'nproc_x': 4, 'nproc_y':  9, 'max_fopen': 36, 'nprocx_in': 12, 'nprocy_in': 27 }
+    }
+
+    return processors[self.caseid]
+  #enddef
+
+  def getFrames(self) :
+    ''' return tuple (number_patch, number_frame) '''
+
+    frames = {
+      'hurricane1': (12,577),  ## 48 hours forecast (172800 seconds) at 300 second interval
+      'hurricane2': (24,865),  ## 72 hours forecast (259200 seconds) at 300 second interval
+      'typhoon1'  : (18,577)
+    }
+
+    return frames[self.caseid]
+  #enddef
+
+  def getCasename(self) :
+    ''' return case name dictionary '''
+
+    casenames = {
+      'hurricane1': {'gfs':'GFS',  'ekf' : 'EnKF'},
+      'hurricane2': {'gfs':'GSIA', 'ekf' : 'EnKFA'},
+      'typhoon1'  : {'gfs':'GFS',  'ekf' : 'EnKF'}
+    }
+
+    return casenames[self.caseid]
+  #enddef
+
+  def getCaptionString(self,case) :
+    ''' return caption string '''
+
+    casestr = self.getCasename()[case]
+
+    captions = {
+      'hurricane1': casestr+''' IC\/LBC (1800x900x50, dx=4 km)''',
+      'hurricane2': casestr+''' IC\/LBC (2000x1200x50, dx=4 km)''',
+      'typhoon1'  : casestr+''' IC\/LBC (1500x1080x50, dx=4 km)'''
+    }
+
+    return captions[self.caseid]
+  #enddef
+
+  def getFooterString(self,case) :
+    ''' return footer string '''
+
+    casestr = self.getCasename()[case]
+
+    captions = {
+      'hurricane1': casestr+', 1800x900x50, dx=4 km)',
+      'hurricane2': casestr+', 2000x1200x50, dx=4 km)',
+      'typhoon1'  : casestr+', 1500x1080x50, dx=4 km)'
+    }
+
+    return captions[self.caseid]
+  #enddef
+
+  def getRunname(self) :
+    ''' return run name dict '''
+
+    runnames = {
+      'hurricane1': {'gfs':'atl_hurr_gfs',   'ekf' : 'atl_hurr_enkf'},
+      'hurricane2': {'gfs':'GSIA',           'ekf' : 'EnKFA'},
+      'typhoon1'  : {'gfs':'hurr3',          'ekf' : 'hurr4'}
+    }
+
+    return runnames[self.caseid]
+  #enddef
+
+
+  def getDestname(self) :
+    ''' return name string on downdraft '''
+
+    destnames = {
+      'hurricane1': 'hurricane',
+      'hurricane2': 'hurricane2',
+      'typhoon1'  : 'typhoon'
+    }
+
+    return destnames[self.caseid]
+  #enddef
+
+#endclass
+
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+##
+## Genearl classes
+##
+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+class runException(Exception):
+
+  '''Run-time exception'''
+  def __init__(self,message_in):
+    Exception.__init__(self)
+    self.message = message_in
+  #enddef
+
+#endclass
+
+########################################################################
+## Entance Point
+########################################################################
+
+if (__name__ == '__main__') :
+##-----------------------------------------------------------------------
+## Defined global variables
+##
+## cmd
+## args
+## _debug
+##
+##-----------------------------------------------------------------------
+  _debug = 0
+  run_mode = 0                                 ## < 0 : norun
+                                               ## = 0 : normal
+                                               ## = 2 : unpack only
+                                               ## = 3 : rename only
+  queuename = 'caps_forecast'
+
+  cmdin = sys.argv[0]
+  (cmdpath,cmd) = os.path.split(cmdin)
+
+  args  = parseArgv(sys.argv[1:])
+
+  if cmd == 'runh1' :
+    runCase = caseConfiguration('hurricane1')
+  elif cmd == 'runh2' :
+    runCase = caseConfiguration('hurricane2')
+  elif cmd == 'runt1' :
+    runCase = caseConfiguration('typhoon1')
+  else :
+    runCase = caseConfiguration('hurricane2')
+    print "\nAssume hurricane over Atlantic with 2012 domain.\n"
+
+  workdir = '/scratch/ywang/hurr2'
+  datadir = '/mnt/work/arpsdata/arpsfcst'
+
+  if run_mode < 0 :
+    outfile = sys.stdout
+  else :
+    stdfile = os.path.join(workdir,"%s%s%s.out"%args[:3])
+    outfile = open(stdfile,"w")
+
+  try:
+    starttime = time.time()
+    main(runCase,args[0],args[1],args[2],args[3])
+    print >>outfile, "\nTotal elapsed time is %f seconds.\n" % (time.time()-starttime)
+
+  except runException, ex:
+    outfile.write(ex.message+'\nSystem aborting ...\n')
+
+  ##finally:
+  ##outfile.close()
